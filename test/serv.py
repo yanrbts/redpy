@@ -1,108 +1,111 @@
 """
-Red Gateway - High-Performance UDP Traffic Receiver Unit.
-Validates arrived packet telemetry, payload structure, and sequence compliance.
+Red Gateway - High-Performance UDP Traffic Decapsulator & Receiver.
+Automatically strips outbound layer-2/layer-3 tunnel framing natively in Python.
 """
 
 import argparse
-import socket
+import os
 import sys
 import time
+from scapy.all import sniff, IP, UDP, Ether
+from rich.console import Console
+from rich.table import Table
+from rich.live import Live
+
+console = Console()
+
+# ───────────────────────────────────────────────────────────────────────
+#   PARSER & BOUNDARY CONFIGURATION
+# ───────────────────────────────────────────────────────────────────────
+parser = argparse.ArgumentParser(description="High-performance Tunnel Decapsulator Node.")
+parser.add_argument("-i", "--iface", type=str, default="ens33", help="Physical NIC to monitor.")
+parser.add_argument("-p", "--port", type=int, default=52719, help="Tunnel Destination UDP Port to intercept.")
+args = parser.parse_args()
+
+class AuditTelemetry:
+    total_tunnels_peeled = 0
+    inner_payload_bytes = 0
+    last_inner_src = "0.0.0.0"
+    last_inner_dst = "0.0.0.0"
+
+stats = AuditTelemetry()
+
+
+def build_live_screen() -> Table:
+    """精美 TUI 渲染面"""
+    table = Table(title="[bold cyan]130 Audit Node[/bold cyan] - Decapsulation Plane", expand=True)
+    table.add_column("Telemetry Metric", justify="left", style="magenta")
+    table.add_column("De-capsulated Value", justify="right", style="green")
+    
+    table.add_row("Receiver Backend", "Scapy Kernel BPF + Deep Packet Dissector")
+    table.add_row("Peeled Tunnel Packets", f"{stats.total_tunnels_peeled:,} Pkts")
+    table.add_row("Last Inner Payload Size", f"{stats.inner_payload_bytes} Bytes")
+    table.add_row("Extracted Inner Route", f"{stats.last_inner_src} ──> {stats.last_inner_dst}")
+    return table
+
+
+def tunnel_decap_processor(pkt):
+    """
+    🌟 核心脱壳核心
+    当外层 UDP 52719 的套娃包落地 130 时，物理剥离外层，还原最里面 128 的核心数据
+    """
+    try:
+        # 1. 安全边界检查：确保这个包带有 UDP 层
+        if not pkt.haslayer(UDP):
+            return
+
+        # 2. 🌟 提取外层的 UDP 载荷（也就是网关网强行塞进来的整个二层二进制流）
+        outer_udp_payload = bytes(pkt[UDP].payload)
+        
+        # 3. 降维打击：将这串二进制流重新还原成一个 Scapy 能够识别的二层以太网帧对象
+        # 这一步叫“解套娃 / 脱壳”
+        inner_frame = Ether(outer_udp_payload)
+        
+        # 4. 穿透审计：提取最核心的、128 打过来的原始三层 IP 资产
+        if inner_frame.haslayer(IP):
+            inner_ip = inner_frame[IP]
+            stats.last_inner_src = inner_ip.src
+            stats.last_inner_dst = inner_ip.dst
+            
+            # 5. 提取最核心的业务数据载荷
+            if inner_ip.haslayer(UDP):
+                inner_payload = bytes(inner_ip[UDP].payload)
+                stats.inner_payload_bytes = len(inner_payload)
+                stats.total_tunnels_peeled += 1
+
+    except Exception:
+        pass
 
 
 def main():
-    # ────────────────────────────────────────────────────────────────
-    # COMMAND LINE INTERFACE DESIGN (ARGPARSE CONFIGURATION)
-    # ────────────────────────────────────────────────────────────────
-    parser = argparse.ArgumentParser(
-        description="Industrial-grade UDP packet receiver for gateway egress validation.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    if os.getuid() != 0:
+        console.print("❌ [Security] Packet dissection requires root privileges: sudo $(which uv) run ...")
+        sys.exit(1)
+
+    import threading
+    
+    # 🌟 告诉内核：只捕获发往本机的、端口为 52719 的常规套娃 UDP 包
+    # 这样内核 BPF 会把杂质完全过滤，保障 130 系统绝对不卡！
+    bpf_filter = f"udp dst port {args.port}"
+    
+    sniff_thread = threading.Thread(
+        target=lambda: sniff(
+            iface=args.iface,
+            filter=bpf_filter,
+            prn=tunnel_decap_processor,
+            store=0
+        ),
+        daemon=True
     )
-    
-    parser.add_argument("-i", "--ip", type=str, default="0.0.0.0", help="Binding IPv4 address. Use 0.0.0.0 for all interfaces.")
-    parser.add_argument("-p", "--port", type=int, default=52719, help="Target Listening UDP Port.")
-    parser.add_argument("-b", "--buffer", type=int, default=1024 * 1024, help="OS-level Socket Receive Buffer allocation (SO_RCVBUF) in bytes.")
+    sniff_thread.start()
 
-    args = parser.parse_args()
-
-    # ────────────────────────────────────────────────────────────────
-    # NETWORK DATA PLANE INITIALIZATION
-    # ────────────────────────────────────────────────────────────────
-    # Instantiate standard IPv4 UDP reception socket
-    rx_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    
-    try:
-        # 🌟 INDUSTRIAL DEFENSE: Scale up the kernel-level network ring buffer size.
-        # This prevents the Linux OS from dropping packets under high-throughput spikes.
-        rx_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, args.buffer)
-        
-        # Bind socket to the requested physical interface boundary
-        rx_sock.bind((args.ip, args.port))
-    except PermissionError:
-        print(f"❌ [Permission Denied] Cannot bind to port {args.port}. Root privileges may be required.")
-        sys.exit(1)
-    except Exception as e:
-        print(f"❌ [Binding Failure] Failed to collapse infrastructure onto {args.ip}:{args.port}. Details: {e}")
-        sys.exit(1)
-
-    # Fetch actual buffer size allocated by the kernel (Linux usually doubles the requested value)
-    actual_buf_size = rx_sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
-
-    print("🛰️  [Traffic Receiver] Egress auditing node online.")
-    print(f"   ↳ Listening Grid   : {args.ip}:{args.port}")
-    print(f"   ↳ Kernel Ring Alloc: {actual_buf_size / 1024:.1f} KB (SO_RCVBUF scaled)")
-    print("   ↳ Monitor Status   : Awaiting ingress gateway streams... (Press Ctrl+C to intercept)")
-    print("-" * 80)
-
-    # ────────────────────────────────────────────────────────────────
-    # REAL-TIME INGRESS AUDITING LOOP
-    # ────────────────────────────────────────────────────────────────
-    total_received_pkts = 0
-    total_received_bytes = 0
-    start_time = None
-
-    try:
-        while True:
-            # Reusable buffer read window (Standard MTU size 2048 to prevent fragmentation truncation)
-            data, addr = rx_sock.recvfrom(2048)
-            
-            # Start timer calculation upon the arrival of the absolute first frame
-            if start_time is None:
-                start_time = time.time()
-
-            pkt_len = len(data)
-            total_received_pkts += 1
-            total_received_bytes += pkt_len
-
-            # Fetch high-resolution absolute timestamp
-            timestamp = time.strftime("%H:%M:%S", time.localtime())
-            micros = int((time.time() % 1) * 1000000)
-
-            # High-performance inline stream printout
-            # Display packet count, sender metadata, payload size, and timestamp matrix
-            sys.stdout.write(
-                f"[{timestamp}.{micros:06d}] #[{total_received_pkts:06d}] "
-                f"Ingress from {addr[0]}:{addr[1]} ──> Quantum: {pkt_len} Bytes\n"
-            )
-            
-            # Industrial optimization: Flush standard output buffer selectively to prevent I/O blocking
-            if total_received_pkts % 10 == 0:
-                sys.stdout.flush()
-
-    except KeyboardInterrupt:
-        print("\n🛑 [Traffic Receiver] Auditing intercepted by operator sequence.")
-        
-    finally:
-        print("-" * 80)
-        print("📊 [Audit Session Telemetry Summary]")
-        print(f"   ↳ Aggregated Received Frames : {total_received_pkts:,} Pkts")
-        print(f"   ↳ Aggregated Volumetric Data : {total_received_bytes / (1024 * 1024):.4f} MB")
-        
-        if start_time and (time.time() - start_time) > 0:
-            duration = time.time() - start_time
-            print(f"   ↳ Total Session Duration     : {duration:.3f} Seconds")
-            print(f"   ↳ Steady-State Performance   : {total_received_pkts / duration:.2f} Pkts/Sec")
-            
-        rx_sock.close()
+    with Live(build_live_screen(), auto_refresh=False, screen=True) as live:
+        try:
+            while True:
+                live.update(build_live_screen(), refresh=True)
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Auditing node gracefully detached.[/yellow]")
 
 
 if __name__ == "__main__":

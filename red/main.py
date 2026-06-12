@@ -24,8 +24,8 @@ async def main():
     # Change these values to match target network interface names
     # Set both identical to trigger single-NIC UDP payload fallback loop
     # ────────────────────────────────────────────────────────
-    ETH1_NAME = "eth0"
-    ETH2_NAME = "eth0"
+    ETH1_NAME = "ens33"
+    ETH2_NAME = "ens37"
     
     is_loopback = (ETH1_NAME == ETH2_NAME)
 
